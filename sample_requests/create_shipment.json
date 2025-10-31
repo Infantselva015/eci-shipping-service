@@ -1,0 +1,10 @@
+{
+  "order_id": 101,
+  "carrier": "DHL",
+  "shipping_address": {
+    "street": "221B Baker Street",
+    "city": "London",
+    "postal_code": "NW1 6XE",
+    "country": "UK"
+  }
+}

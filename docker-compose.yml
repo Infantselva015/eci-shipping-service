@@ -1,0 +1,53 @@
+version: '3.8'
+
+services:
+  shipping-db:
+    image: postgres:14-alpine
+    container_name: shipping-postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: shipping_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - shipping-db-data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - eci-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d shipping_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  shipping-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: shipping-service
+    ports:
+      - "8085:8005"
+    environment:
+      DATABASE_URL: "postgresql://user:password@shipping-db:5432/shipping_db"
+      LOG_LEVEL: "INFO"
+    depends_on:
+      shipping-db:
+        condition: service_healthy
+    networks:
+      - eci-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+volumes:
+  shipping-db-data:
+    driver: local
+
+networks:
+  eci-network:
+    driver: bridge

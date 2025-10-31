@@ -1,0 +1,129 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping-service
+  labels:
+    app: shipping-service
+    version: v1
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: shipping-service
+  template:
+    metadata:
+      labels:
+        app: shipping-service
+        version: v1
+    spec:
+      containers:
+      - name: shipping-service
+        image: shipping-service:latest
+        imagePullPolicy: Never  # For local Minikube development
+        ports:
+        - containerPort: 8005
+          name: http
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: shipping-config
+              key: DATABASE_URL
+        - name: LOG_LEVEL
+          value: "INFO"
+        - name: PORT
+          value: "8005"
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8005
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping-db
+  labels:
+    app: shipping-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shipping-db
+  template:
+    metadata:
+      labels:
+        app: shipping-db
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:14-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_USER
+          value: "user"
+        - name: POSTGRES_PASSWORD
+          value: "password"
+        - name: POSTGRES_DB
+          value: "shipping_db"
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        - name: init-script
+          mountPath: /docker-entrypoint-initdb.d
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - user
+            - -d
+            - shipping_db
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - user
+            - -d
+            - shipping_db
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: shipping-db-pvc
+      - name: init-script
+        configMap:
+          name: shipping-db-init
