@@ -1,21 +1,58 @@
-﻿from fastapi import FastAPI, HTTPException, Depends
+﻿from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from typing import Optional, List
-from datetime import datetime
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, validator
+from typing import Optional, List, Dict, Any
+from datetime import datetime, timedelta
 from enum import Enum
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, func, Index
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import logging
 import json
+import os
+import re
+import hashlib
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
 
-# Configure structured logging
+# Configure structured logging with PII masking
+class PIIMaskingFormatter(logging.Formatter):
+    """Custom formatter to mask PII in logs"""
+    
+    @staticmethod
+    def mask_pii(text: str) -> str:
+        # Mask email addresses
+        text = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', '***@***.***', text)
+        # Mask phone numbers
+        text = re.sub(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b', '***-***-****', text)
+        # Mask tracking numbers (keep first 3 chars)
+        text = re.sub(r'\bTRK\d{4,}\b', lambda m: m.group(0)[:6] + '***', text)
+        return text
+    
+    def format(self, record):
+        original = super().format(record)
+        return self.mask_pii(original)
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
+for handler in logger.handlers:
+    handler.setFormatter(PIIMaskingFormatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+
+# Prometheus metrics
+SHIPMENTS_CREATED = Counter('shipments_created_total', 'Total shipments created')
+SHIPMENTS_DELIVERED = Counter('shipments_delivered_total', 'Total shipments delivered')
+SHIPMENTS_CANCELLED = Counter('shipments_cancelled_total', 'Total shipments cancelled')
+SHIPMENTS_FAILED = Counter('shipments_failed_total', 'Total shipments failed')
+STATUS_UPDATES = Counter('status_updates_total', 'Total status updates')
+API_REQUESTS = Counter('api_requests_total', 'Total API requests', ['method', 'endpoint', 'status'])
+SHIPMENT_LATENCY = Histogram('shipment_operation_latency_seconds', 'Shipment operation latency', ['operation'])
 
 app = FastAPI(
     title="Shipping Service API",
@@ -35,17 +72,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Metrics storage (in-memory for simplicity, use Prometheus in production)
-metrics = {
-    "shipments_created_total": 0,
-    "shipments_delivered_total": 0,
-    "shipments_cancelled_total": 0,
-    "shipments_failed_total": 0,
-    "status_updates_total": 0
-}
+# Environment configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/shipping_db")
+RESERVATION_TTL_MINUTES = int(os.getenv("RESERVATION_TTL_MINUTES", "15"))
+INVENTORY_SERVICE_URL = os.getenv("INVENTORY_SERVICE_URL", "http://inventory-service:8003")
+ORDER_SERVICE_URL = os.getenv("ORDER_SERVICE_URL", "http://order-service:8002")
 
 # Database setup
-DATABASE_URL = "postgresql://user:password@shipping-db:5432/shipping_db"
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -89,11 +122,39 @@ class ShipmentEvent(Base):
     description = Column(String(500), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+class IdempotencyKey(Base):
+    __tablename__ = "idempotency_keys"
+    id = Column(Integer, primary_key=True, index=True)
+    key = Column(String(255), unique=True, nullable=False, index=True)
+    request_hash = Column(String(64), nullable=False)
+    response_data = Column(String(2000), nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    
+    __table_args__ = (
+        Index('idx_idempotency_key', 'key'),
+        Index('idx_expires_at', 'expires_at'),
+    )
+
 # Pydantic schemas
+class ErrorResponse(BaseModel):
+    """Standard error response schema"""
+    error: str
+    message: str
+    status_code: int
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    request_id: Optional[str] = None
+
 class CreateShipmentRequest(BaseModel):
     order_id: int
     carrier: Carrier = Field(default=Carrier.DHL)
     shipping_address: Optional[dict] = None
+    
+    @validator('order_id')
+    def validate_order_id(cls, v):
+        if v <= 0:
+            raise ValueError('order_id must be positive')
+        return v
 
 class CreateShipmentResponse(BaseModel):
     shipment_id: int
@@ -139,82 +200,195 @@ def get_db():
         db.close()
 
 # Helper functions
-def generate_tracking_number():
+def generate_tracking_number(db: Session):
     """Generate unique tracking number"""
     import random
-    return f"TRK{random.randint(1000, 9999)}"
+    while True:
+        tracking_no = f"TRK{random.randint(100000, 999999)}"
+        existing = db.query(Shipment).filter(Shipment.tracking_no == tracking_no).first()
+        if not existing:
+            return tracking_no
 
 def select_carrier() -> str:
     """Select carrier based on availability (can be enhanced with logic)"""
     import random
     return random.choice([c.value for c in Carrier])
 
+def compute_request_hash(data: dict) -> str:
+    """Compute SHA-256 hash of request data"""
+    json_str = json.dumps(data, sort_keys=True)
+    return hashlib.sha256(json_str.encode()).hexdigest()
+
+def check_idempotency(db: Session, idempotency_key: str, request_data: dict) -> Optional[dict]:
+    """Check if request has been processed before"""
+    if not idempotency_key:
+        return None
+    
+    # Clean up expired keys
+    db.query(IdempotencyKey).filter(IdempotencyKey.expires_at < datetime.utcnow()).delete()
+    db.commit()
+    
+    existing = db.query(IdempotencyKey).filter(IdempotencyKey.key == idempotency_key).first()
+    if existing:
+        request_hash = compute_request_hash(request_data)
+        if existing.request_hash == request_hash:
+            # Return cached response
+            return json.loads(existing.response_data)
+        else:
+            # Same key, different request - error
+            raise HTTPException(
+                status_code=409,
+                detail="Idempotency key already used with different request data"
+            )
+    return None
+
+def store_idempotency(db: Session, idempotency_key: str, request_data: dict, response_data: dict):
+    """Store idempotency key and response"""
+    if not idempotency_key:
+        return
+    
+    request_hash = compute_request_hash(request_data)
+    expires_at = datetime.utcnow() + timedelta(hours=24)
+    
+    idempotency_record = IdempotencyKey(
+        key=idempotency_key,
+        request_hash=request_hash,
+        response_data=json.dumps(response_data, default=str),
+        expires_at=expires_at
+    )
+    db.add(idempotency_record)
+    db.commit()
+
+async def notify_inventory_release(order_id: int, reason: str):
+    """Notify Inventory Service to release reserved stock"""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{INVENTORY_SERVICE_URL}/v1/inventory/release",
+                json={"order_id": order_id, "reason": reason},
+                timeout=5.0
+            )
+            if response.status_code == 200:
+                logger.info(f"Successfully notified inventory to release for order {order_id}")
+            else:
+                logger.warning(f"Failed to notify inventory release: {response.status_code}")
+    except Exception as e:
+        logger.error(f"Error notifying inventory service: {str(e)}")
+
+# Custom exception handler
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request, exc):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=ErrorResponse(
+            error=exc.detail if isinstance(exc.detail, str) else "HTTP Exception",
+            message=str(exc.detail),
+            status_code=exc.status_code,
+            timestamp=datetime.utcnow()
+        ).dict()
+    )
+
+@app.exception_handler(Exception)
+async def general_exception_handler(request, exc):
+    logger.error(f"Unhandled exception: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            error="Internal Server Error",
+            message="An unexpected error occurred",
+            status_code=500,
+            timestamp=datetime.utcnow()
+        ).dict()
+    )
+
 # API Endpoints
 
 @app.post("/v1/shipments", response_model=CreateShipmentResponse, status_code=201)
 async def create_shipment(
     request: CreateShipmentRequest,
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
     db: Session = Depends(get_db)
 ):
     """
-    Create a new shipment for an order
+    Create a new shipment for an order (Idempotent)
+    
+    Headers:
+    - Idempotency-Key: Unique key to prevent duplicate shipment creation
     """
-    try:
-        # Check if shipment already exists for order
-        existing = db.query(Shipment).filter(Shipment.order_id == request.order_id).first()
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Shipment already exists for order {request.order_id}"
+    with SHIPMENT_LATENCY.labels(operation='create').time():
+        try:
+            # Check idempotency
+            request_data = request.dict()
+            cached_response = check_idempotency(db, idempotency_key, request_data)
+            if cached_response:
+                logger.info(f"Returning cached response for idempotency key: {idempotency_key}")
+                API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='200').inc()
+                return JSONResponse(content=cached_response, status_code=201)
+            
+            # Check if shipment already exists for order
+            existing = db.query(Shipment).filter(Shipment.order_id == request.order_id).first()
+            if existing:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Shipment already exists for order {request.order_id}"
+                )
+            
+            # Create shipment
+            shipment = Shipment(
+                order_id=request.order_id,
+                carrier=request.carrier.value,
+                status=ShipmentStatus.PENDING.value,
+                tracking_no=generate_tracking_number(db)
             )
-        
-        # Create shipment
-        shipment = Shipment(
-            order_id=request.order_id,
-            carrier=request.carrier.value,
-            status=ShipmentStatus.PENDING.value,
-            tracking_no=generate_tracking_number()
-        )
-        db.add(shipment)
-        db.flush()
-        
-        # Create initial event
-        event = ShipmentEvent(
-            shipment_id=shipment.shipment_id,
-            status=ShipmentStatus.PENDING.value,
-            description="Shipment created"
-        )
-        db.add(event)
-        
-        db.commit()
-        db.refresh(shipment)
-        
-        # Update metrics
-        metrics["shipments_created_total"] += 1
-        
-        logger.info(json.dumps({
-            "event": "shipment_created",
-            "shipment_id": shipment.shipment_id,
-            "order_id": request.order_id,
-            "carrier": shipment.carrier,
-            "tracking_no": shipment.tracking_no
-        }))
-        
-        return CreateShipmentResponse(
-            shipment_id=shipment.shipment_id,
-            order_id=shipment.order_id,
-            carrier=shipment.carrier,
-            status=shipment.status,
-            tracking_no=shipment.tracking_no,
-            created_at=shipment.created_at
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Failed to create shipment: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+            db.add(shipment)
+            db.flush()
+            
+            # Create initial event
+            event = ShipmentEvent(
+                shipment_id=shipment.shipment_id,
+                status=ShipmentStatus.PENDING.value,
+                description="Shipment created"
+            )
+            db.add(event)
+            
+            db.commit()
+            db.refresh(shipment)
+            
+            # Update metrics
+            SHIPMENTS_CREATED.inc()
+            API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='201').inc()
+            
+            response_data = {
+                "shipment_id": shipment.shipment_id,
+                "order_id": shipment.order_id,
+                "carrier": shipment.carrier,
+                "status": shipment.status,
+                "tracking_no": shipment.tracking_no,
+                "created_at": shipment.created_at.isoformat()
+            }
+            
+            # Store idempotency
+            store_idempotency(db, idempotency_key, request_data, response_data)
+            
+            logger.info(json.dumps({
+                "event": "shipment_created",
+                "shipment_id": shipment.shipment_id,
+                "order_id": request.order_id,
+                "carrier": shipment.carrier,
+                "tracking_no": shipment.tracking_no
+            }))
+            
+            return CreateShipmentResponse(**response_data)
+            
+        except HTTPException:
+            API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='error').inc()
+            raise
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to create shipment: {str(e)}")
+            API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='500').inc()
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/shipments/{shipment_id}", response_model=ShipmentResponse)
 async def get_shipment(shipment_id: int, db: Session = Depends(get_db)):
@@ -313,12 +487,13 @@ async def update_shipment_status(
             shipment.shipped_at = datetime.utcnow()
         elif request.status == ShipmentStatus.DELIVERED and not shipment.delivered_at:
             shipment.delivered_at = datetime.utcnow()
-            metrics["shipments_delivered_total"] += 1
+            SHIPMENTS_DELIVERED.inc()
         elif request.status == ShipmentStatus.FAILED:
-            metrics["shipments_failed_total"] += 1
+            SHIPMENTS_FAILED.inc()
         
         # Update metrics
-        metrics["status_updates_total"] += 1
+        STATUS_UPDATES.inc()
+        API_REQUESTS.labels(method='PATCH', endpoint='/v1/shipments/status', status='200').inc()
         
         # Create tracking event
         event = ShipmentEvent(
@@ -386,7 +561,11 @@ async def cancel_shipment(shipment_id: int, db: Session = Depends(get_db)):
         db.commit()
         
         # Update metrics
-        metrics["shipments_cancelled_total"] += 1
+        SHIPMENTS_CANCELLED.inc()
+        API_REQUESTS.labels(method='DELETE', endpoint='/v1/shipments', status='200').inc()
+        
+        # Notify inventory to release reservations
+        await notify_inventory_release(shipment.order_id, "Shipment cancelled")
         
         logger.info(json.dumps({
             "event": "shipment_cancelled",
@@ -443,7 +622,12 @@ async def health_check():
 
 @app.get("/metrics")
 async def get_metrics(db: Session = Depends(get_db)):
-    """Get service metrics for monitoring"""
+    """Get Prometheus metrics"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/metrics/summary")
+async def get_metrics_summary(db: Session = Depends(get_db)):
+    """Get service metrics summary for monitoring dashboard"""
     try:
         # Database metrics
         total_shipments = db.query(func.count(Shipment.shipment_id)).scalar()
@@ -457,20 +641,23 @@ async def get_metrics(db: Session = Depends(get_db)):
                 ShipmentStatus.OUT_FOR_DELIVERY.value
             ])
         ).scalar()
+        delivered_shipments = db.query(func.count(Shipment.shipment_id)).filter(
+            Shipment.status == ShipmentStatus.DELIVERED.value
+        ).scalar()
+        failed_shipments = db.query(func.count(Shipment.shipment_id)).filter(
+            Shipment.status == ShipmentStatus.FAILED.value
+        ).scalar()
         
         return {
             "service": "shipping-service",
             "timestamp": datetime.utcnow().isoformat(),
             "status": "operational",
-            "metrics": {
-                "shipments_created_total": metrics["shipments_created_total"],
-                "shipments_delivered_total": metrics["shipments_delivered_total"],
-                "shipments_cancelled_total": metrics["shipments_cancelled_total"],
-                "shipments_failed_total": metrics["shipments_failed_total"],
-                "status_updates_total": metrics["status_updates_total"],
-                "total_shipments_in_db": total_shipments,
+            "database_metrics": {
+                "total_shipments": total_shipments,
                 "pending_shipments": pending_shipments,
-                "in_transit_shipments": in_transit_shipments
+                "in_transit_shipments": in_transit_shipments,
+                "delivered_shipments": delivered_shipments,
+                "failed_shipments": failed_shipments
             }
         }
     except Exception as e:
@@ -478,6 +665,6 @@ async def get_metrics(db: Session = Depends(get_db)):
         return {
             "service": "shipping-service",
             "timestamp": datetime.utcnow().isoformat(),
-            "status": "operational",
-            "metrics": metrics
+            "status": "error",
+            "error": str(e)
         }
