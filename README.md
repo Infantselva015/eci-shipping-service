@@ -1,14 +1,14 @@
-# Shipping Service# Shipping Service - ECI Microservices
+# Shipping Service - ECI Microservices
 
 
 
-## Overview## Overview
+## Overview
 
 The Shipping Service manages shipment creation, tracking, and delivery status updates for e-commerce orders. It provides comprehensive shipment lifecycle management with multi-carrier support and real-time tracking capabilities.The Shipping Service is responsible for managing shipments, tracking, and delivery status updates for the E-commerce with Inventory (ECI) platform.
 
 
 
-## Features## Features
+# Features
 
 - **Shipment Management**: Create, update, and cancel shipments- ✅ Create shipments for confirmed orders
 
