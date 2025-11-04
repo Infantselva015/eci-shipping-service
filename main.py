@@ -304,6 +304,35 @@ async def general_exception_handler(request, exc):
 
 # API Endpoints
 
+async def send_notification(user_id: int, notification_type: str, message: str, shipment_id: int = None):
+    """Send notification via notification service"""
+    import httpx
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "user_id": user_id,
+                "type": notification_type,
+                "message": message,
+                "channel": "EMAIL"
+            }
+            if shipment_id:
+                payload["metadata"] = {"shipment_id": shipment_id}
+            
+            response = await client.post(
+                f"{os.getenv('NOTIFICATION_SERVICE_URL', 'http://notification-service:8004')}/v1/notifications",
+                json=payload,
+                timeout=5.0
+            )
+            if response.status_code in [200, 201]:
+                logger.info(f"Successfully sent {notification_type} notification to user {user_id}")
+                return True
+            else:
+                logger.warning(f"Failed to send notification: {response.status_code}")
+                return False
+    except Exception as e:
+        logger.error(f"Error sending notification: {str(e)}")
+        return False
+
 @app.post("/v1/shipments", response_model=CreateShipmentResponse, status_code=201)
 async def create_shipment(
     request: CreateShipmentRequest,
@@ -320,11 +349,12 @@ async def create_shipment(
         try:
             # Check idempotency
             request_data = request.dict()
-            cached_response = check_idempotency(db, idempotency_key, request_data)
-            if cached_response:
-                logger.info(f"Returning cached response for idempotency key: {idempotency_key}")
-                API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='200').inc()
-                return JSONResponse(content=cached_response, status_code=201)
+            if idempotency_key:
+                cached_response = check_idempotency(db, idempotency_key, request_data)
+                if cached_response:
+                    logger.info(f"Returning cached response for idempotency key: {idempotency_key}")
+                    API_REQUESTS.labels(method='POST', endpoint='/v1/shipments', status='200').inc()
+                    return JSONResponse(content=cached_response, status_code=201)
             
             # Check if shipment already exists for order
             existing = db.query(Shipment).filter(Shipment.order_id == request.order_id).first()
@@ -369,7 +399,8 @@ async def create_shipment(
             }
             
             # Store idempotency
-            store_idempotency(db, idempotency_key, request_data, response_data)
+            if idempotency_key:
+                store_idempotency(db, idempotency_key, request_data, response_data)
             
             logger.info(json.dumps({
                 "event": "shipment_created",
@@ -378,6 +409,15 @@ async def create_shipment(
                 "carrier": shipment.carrier,
                 "tracking_no": shipment.tracking_no
             }))
+            
+            # Send notification (async, non-blocking)
+            import asyncio
+            asyncio.create_task(send_notification(
+                user_id=request.order_id,  # Assuming order_id maps to user_id, adjust as needed
+                notification_type="SHIPMENT_CREATED",
+                message=f"Your order has been shipped! Tracking number: {shipment.tracking_no}. Carrier: {shipment.carrier}",
+                shipment_id=shipment.shipment_id
+            ))
             
             return CreateShipmentResponse(**response_data)
             
@@ -514,6 +554,37 @@ async def update_shipment_status(
             "new_status": request.status.value,
             "location": request.location
         }))
+        
+        # Send notifications based on status
+        import asyncio
+        if request.status == ShipmentStatus.SHIPPED:
+            asyncio.create_task(send_notification(
+                user_id=shipment.order_id,
+                notification_type="SHIPMENT_SHIPPED",
+                message=f"Your order has been shipped! Tracking: {shipment.tracking_no}",
+                shipment_id=shipment_id
+            ))
+        elif request.status == ShipmentStatus.OUT_FOR_DELIVERY:
+            asyncio.create_task(send_notification(
+                user_id=shipment.order_id,
+                notification_type="OUT_FOR_DELIVERY",
+                message=f"Your order is out for delivery! Tracking: {shipment.tracking_no}",
+                shipment_id=shipment_id
+            ))
+        elif request.status == ShipmentStatus.DELIVERED:
+            asyncio.create_task(send_notification(
+                user_id=shipment.order_id,
+                notification_type="SHIPMENT_DELIVERED",
+                message=f"Your order has been delivered! Tracking: {shipment.tracking_no}",
+                shipment_id=shipment_id
+            ))
+        elif request.status == ShipmentStatus.FAILED:
+            asyncio.create_task(send_notification(
+                user_id=shipment.order_id,
+                notification_type="SHIPMENT_FAILED",
+                message=f"Delivery attempt failed. Tracking: {shipment.tracking_no}. We'll retry soon.",
+                shipment_id=shipment_id
+            ))
         
         return ShipmentResponse(
             shipment_id=shipment.shipment_id,
