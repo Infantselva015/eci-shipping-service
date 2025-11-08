@@ -3,6 +3,21 @@
 -- Drop existing tables if they exist
 DROP TABLE IF EXISTS shipment_events CASCADE;
 DROP TABLE IF EXISTS shipments CASCADE;
+DROP TABLE IF EXISTS idempotency_keys CASCADE;
+
+-- Create idempotency_keys table
+CREATE TABLE idempotency_keys (
+    id SERIAL PRIMARY KEY,
+    key VARCHAR(255) UNIQUE NOT NULL,
+    request_hash VARCHAR(64) NOT NULL,
+    response_data VARCHAR(2000) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP NOT NULL
+);
+
+-- Create indexes for faster lookups
+CREATE INDEX idx_idempotency_key ON idempotency_keys(key);
+CREATE INDEX idx_idempotency_expires_at ON idempotency_keys(expires_at);
 
 -- Create shipments table
 CREATE TABLE shipments (
