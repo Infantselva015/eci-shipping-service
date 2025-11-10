@@ -1,10 +1,6 @@
 # Shipping Service - Assignment Submission
 
 ## BITS Pilani - WILP Program
-**Course**: Scalable Services  
-**Assignment**: Microservices Architecture Implementation  
-**Submission Date**: November 10, 2025  
-**Group**: [Your Group Number]
 
 ---
 
@@ -368,9 +364,6 @@ Out for Delivery → Delivered
 ```
 
 ---
+**Repository**: https://github.com/Infantselva015/eci-shipping-service
 
 **End of Document**
-
-**Submitted By**: [Student Name(s)]  
-**Date**: November 10, 2025  
-**Repository**: https://github.com/Infantselva015/eci-shipping-service
