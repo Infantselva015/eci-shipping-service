@@ -1,6 +1,7 @@
 ﻿from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel, Field, validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timedelta
@@ -62,6 +63,9 @@ app = FastAPI(
     redoc_url="/redoc",
     openapi_url="/openapi.json"
 )
+
+# Add Prometheus instrumentation
+Instrumentator().instrument(app).expose(app)
 
 # Add CORS middleware
 app.add_middleware(
